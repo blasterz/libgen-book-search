@@ -1,0 +1,225 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>books — search & download</title>
+<style>
+  :root {
+    --bg: #0e1116;
+    --panel: #161b22;
+    --panel-2: #1f252e;
+    --border: #2a313c;
+    --text: #e6edf3;
+    --muted: #8b949e;
+    --accent: #7c5cff;
+    --accent-2: #5a4bc7;
+    --ok: #2ea043;
+    --err: #f85149;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; background: var(--bg); color: var(--text);
+    font: 15px/1.5 ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+  a { color: var(--accent); text-decoration: none; }
+  .wrap { max-width: 980px; margin: 0 auto; padding: 28px 20px 80px; }
+  h1 { font-size: 22px; margin: 0 0 4px; letter-spacing: -0.01em; }
+  .sub { color: var(--muted); margin: 0 0 22px; font-size: 13px; }
+
+  form.search {
+    display: flex; gap: 8px; flex-wrap: wrap;
+    background: var(--panel); border: 1px solid var(--border); border-radius: 12px;
+    padding: 10px; position: sticky; top: 14px; z-index: 10;
+    backdrop-filter: blur(8px);
+  }
+  form.search input[type="text"] {
+    flex: 1 1 320px; min-width: 220px;
+    background: var(--panel-2); color: var(--text);
+    border: 1px solid var(--border); border-radius: 8px;
+    padding: 10px 12px; font-size: 15px; outline: none;
+  }
+  form.search input[type="text"]:focus { border-color: var(--accent); }
+  form.search select, form.search button {
+    background: var(--panel-2); color: var(--text);
+    border: 1px solid var(--border); border-radius: 8px;
+    padding: 10px 12px; font-size: 14px; cursor: pointer;
+  }
+  form.search button {
+    background: var(--accent); border-color: var(--accent); color: white; font-weight: 600;
+    padding-left: 18px; padding-right: 18px;
+  }
+  form.search button:hover { background: var(--accent-2); border-color: var(--accent-2); }
+  form.search button:disabled { opacity: 0.6; cursor: not-allowed; }
+
+  .status { color: var(--muted); font-size: 13px; margin: 18px 2px 8px; min-height: 20px; }
+  .status.err { color: var(--err); }
+
+  .results { display: grid; gap: 10px; }
+  .card {
+    background: var(--panel); border: 1px solid var(--border); border-radius: 10px;
+    padding: 14px 16px; display: grid; grid-template-columns: 1fr auto; gap: 12px;
+    align-items: center;
+  }
+  .card:hover { border-color: #3a4352; }
+  .title { font-weight: 600; font-size: 15px; line-height: 1.35; word-break: break-word; }
+  .meta { color: var(--muted); font-size: 13px; margin-top: 4px; }
+  .tags { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
+  .tag {
+    background: var(--panel-2); border: 1px solid var(--border);
+    padding: 2px 8px; border-radius: 999px; font-size: 12px; color: var(--muted);
+  }
+  .tag.ext { text-transform: uppercase; color: var(--accent); border-color: #2f2660; background: #1a1730; }
+
+  .dl {
+    background: var(--ok); color: white; border: none; border-radius: 8px;
+    padding: 10px 14px; font-weight: 600; font-size: 14px; cursor: pointer;
+    white-space: nowrap;
+  }
+  .dl:disabled { opacity: 0.6; cursor: progress; }
+  .dl:hover:not(:disabled) { filter: brightness(1.08); }
+
+  .empty { text-align: center; padding: 40px 10px; color: var(--muted); }
+  kbd {
+    background: var(--panel-2); border: 1px solid var(--border); border-bottom-width: 2px;
+    border-radius: 4px; padding: 1px 6px; font-size: 12px; font-family: ui-monospace, monospace;
+  }
+
+  @media (max-width: 600px) {
+    .card { grid-template-columns: 1fr; }
+    .dl { justify-self: end; }
+  }
+</style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>books</h1>
+    <p class="sub">Search Library Genesis by title or author, then download in one click.</p>
+
+    <form class="search" id="f">
+      <input type="text" id="q" placeholder="e.g. The Textbook of Clinical Sexual Medicine"
+             autocomplete="off" autofocus />
+      <select id="ext" title="File format">
+        <option value="">any format</option>
+        <option value="pdf">PDF</option>
+        <option value="epub">EPUB</option>
+        <option value="djvu">DJVU</option>
+        <option value="mobi">MOBI</option>
+        <option value="azw3">AZW3</option>
+      </select>
+      <select id="n" title="Results">
+        <option value="10">10</option>
+        <option value="20" selected>20</option>
+        <option value="40">40</option>
+      </select>
+      <button id="go" type="submit">Search</button>
+    </form>
+
+    <div class="status" id="status">Tip: press <kbd>/</kbd> to focus the search box.</div>
+    <div class="results" id="results"></div>
+  </div>
+
+<script>
+  const $ = (s) => document.querySelector(s);
+  const form = $("#f"), qEl = $("#q"), extEl = $("#ext"), nEl = $("#n"),
+        goBtn = $("#go"), statusEl = $("#status"), resEl = $("#results");
+
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "/" && document.activeElement !== qEl) { e.preventDefault(); qEl.focus(); qEl.select(); }
+  });
+
+  function setStatus(msg, isErr) {
+    statusEl.textContent = msg || "";
+    statusEl.classList.toggle("err", !!isErr);
+  }
+
+  function safeFilename(title, ext) {
+    const clean = (title || "book").replace(/[\\/:*?"<>|]+/g, " ").replace(/\s+/g, " ").trim().slice(0, 160);
+    return `${clean}.${(ext || "bin").toLowerCase()}`;
+  }
+
+  function renderResults(rows, mirror) {
+    resEl.innerHTML = "";
+    if (!rows.length) {
+      resEl.innerHTML = `<div class="empty">No results.</div>`;
+      return;
+    }
+    for (const r of rows) {
+      const card = document.createElement("div");
+      card.className = "card";
+      const left = document.createElement("div");
+
+      const title = document.createElement("div");
+      title.className = "title";
+      title.textContent = r.title || "(untitled)";
+      left.appendChild(title);
+
+      const meta = document.createElement("div");
+      meta.className = "meta";
+      meta.textContent = [r.author, r.publisher, r.year].filter(Boolean).join(" — ");
+      left.appendChild(meta);
+
+      const tags = document.createElement("div");
+      tags.className = "tags";
+      if (r.ext)   tags.insertAdjacentHTML("beforeend", `<span class="tag ext">${r.ext}</span>`);
+      if (r.size)  tags.insertAdjacentHTML("beforeend", `<span class="tag">${r.size}</span>`);
+      if (r.lang)  tags.insertAdjacentHTML("beforeend", `<span class="tag">${r.lang}</span>`);
+      if (r.pages) tags.insertAdjacentHTML("beforeend", `<span class="tag">${r.pages}p</span>`);
+      left.appendChild(tags);
+
+      const dl = document.createElement("button");
+      dl.className = "dl";
+      dl.type = "button";
+      dl.textContent = "Download";
+      dl.addEventListener("click", () => startDownload(r, dl));
+
+      card.append(left, dl);
+      resEl.appendChild(card);
+    }
+    setStatus(`${rows.length} result${rows.length === 1 ? "" : "s"} via ${mirror || "libgen"}`);
+  }
+
+  function startDownload(row, btn) {
+    const name = safeFilename(row.title, row.ext);
+    const url = `api/download?md5=${encodeURIComponent(row.md5)}&name=${encodeURIComponent(name)}`;
+    btn.disabled = true;
+    btn.textContent = "Resolving…";
+    // Programmatic <a download> click — works across Safari/Firefox/Chrome
+    // and doesn't navigate away from the search page.
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = name;
+    a.rel = "noopener";
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => {
+      btn.disabled = false;
+      btn.textContent = "Download";
+    }, 1500);
+  }
+
+  async function search(ev) {
+    if (ev) ev.preventDefault();
+    const q = qEl.value.trim();
+    if (!q) { qEl.focus(); return; }
+    goBtn.disabled = true;
+    setStatus("Searching…");
+    resEl.innerHTML = "";
+    try {
+      const params = new URLSearchParams({ q, n: nEl.value });
+      if (extEl.value) params.set("ext", extEl.value);
+      const r = await fetch(`api/search?${params}`);
+      const data = await r.json();
+      if (!r.ok) throw new Error(data.error || `HTTP ${r.status}`);
+      if (data.error && !data.results.length) setStatus(data.error, true);
+      renderResults(data.results || [], data.mirror);
+    } catch (e) {
+      setStatus("Error: " + e.message, true);
+    } finally {
+      goBtn.disabled = false;
+    }
+  }
+
+  form.addEventListener("submit", search);
+</script>
+</body>
+</html>
