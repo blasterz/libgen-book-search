@@ -21,7 +21,7 @@ import sys
 import traceback
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, quote, urlparse
 
 import requests
 
@@ -117,7 +117,7 @@ class Handler(BaseHTTPRequestHandler):
             headers["Referer"] = referer
             headers["Accept"] = "*/*"
             try:
-                r = requests.get(url, headers=headers, stream=True, timeout=120,
+                r = requests.get(url, headers=headers, stream=True, timeout=(8, 120),
                                  allow_redirects=True, verify=libgen_dl.VERIFY_TLS)
                 if r.status_code >= 400:
                     last_err = f"{url} → HTTP {r.status_code}"
@@ -139,6 +139,12 @@ class Handler(BaseHTTPRequestHandler):
                 total = r.headers.get("Content-Length")
                 fname = name or libgen_dl._filename_from_response(r, f"{md5}.bin")
                 fname = fname.replace('"', "'")
+                # HTTP headers are latin-1 only, but filenames carry em-dashes,
+                # smart quotes, accents, etc. Send an ASCII-safe fallback plus an
+                # RFC 5987 UTF-8 form (filename*) that modern browsers prefer.
+                ascii_name = fname.encode("ascii", "ignore").decode("ascii") or f"{md5}.bin"
+                disposition = (f'attachment; filename="{ascii_name}"; '
+                               f"filename*=UTF-8''{quote(fname)}")
 
                 # Pull the first chunk BEFORE sending headers. If the upstream
                 # connection is dead on arrival, this raises here while we can
@@ -155,7 +161,7 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_header("Content-Type", content_type)
                 if total:
                     self.send_header("Content-Length", total)
-                self.send_header("Content-Disposition", f'attachment; filename="{fname}"')
+                self.send_header("Content-Disposition", disposition)
                 self.send_header("Cache-Control", "no-store")
                 self.end_headers()
 
@@ -216,7 +222,7 @@ class Handler(BaseHTTPRequestHandler):
                     rheaders["Range"] = f"bytes={written}-"
                     try:
                         resume = requests.get(url, headers=rheaders, stream=True,
-                                              timeout=120, allow_redirects=True,
+                                              timeout=(8, 120), allow_redirects=True,
                                               verify=libgen_dl.VERIFY_TLS)
                     except requests.RequestException as e2:
                         sys.stderr.write(f"[download] resume request failed: {e2}\n")

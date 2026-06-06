@@ -43,27 +43,36 @@ VERIFY_TLS = False
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # Public libgen search mirrors. Each entry says which search-page schema
-# to use when scraping the results.
+# to use when scraping the results. Ordered live-first: libgen.li/.la (same
+# fork, "li" schema) are currently up; the libgen.is/.rs/.st family shares one
+# frequently-down IP, so we keep just one as a different-fork last resort
+# instead of three copies that each cost a full connect timeout.
 DEFAULT_MIRRORS: list[tuple[str, str]] = [
     ("https://libgen.li", "li"),
+    ("https://libgen.la", "li"),
     ("https://libgen.is", "is"),
-    ("https://libgen.rs", "is"),
-    ("https://libgen.st", "is"),
 ]
 
+# (connect, read) seconds for search. Short connect so a dead mirror fails fast
+# and we fall through to the next instead of hanging ~20s per dead host.
+SEARCH_TIMEOUT = (8, 20)
+
 # Download resolver mirrors — these take an MD5 and return pages with a
-# direct file link. Two fork families: the libgen.li/.gs/.la group serves
-# get.php links via ads.php; the library.lol / libgen.is/.rs/.st group serves
-# a "GET" anchor. resolve_downloads() understands both, and tries every entry
-# so a single timeout or dead host doesn't sink the request.
+# direct file link. libgen.li/.la serve get.php links via ads.php; library.lol
+# serves a "GET" anchor. resolve_downloads() understands both and tries them in
+# order, stopping once it has enough candidates so a healthy first mirror avoids
+# the slow tail. Ordered reliable-first. (libgen.gs is dead DNS; the
+# libgen.is/.rs/.st family shares one frequently-down IP — library.lol already
+# covers that fork, so they're omitted.)
 DL_RESOLVERS = [
     "https://libgen.li/ads.php?md5={md5}",
-    "https://libgen.gs/ads.php?md5={md5}",
     "https://libgen.la/ads.php?md5={md5}",
     "https://library.lol/main/{md5}",
-    "https://libgen.is/ads.php?md5={md5}",
-    "https://libgen.rs/ads.php?md5={md5}",
 ]
+
+# (connect, read) seconds. A short connect timeout makes dead hosts fail fast
+# instead of hanging the whole request; reads can legitimately be slow.
+RESOLVE_TIMEOUT = (8, 25)
 
 
 def search(query: str, mirror: str, schema: str, limit: int) -> list[dict]:
@@ -77,7 +86,7 @@ def _search_is(query: str, mirror: str, limit: int) -> list[dict]:
     """libgen.is / .rs / .st — table.c, columns ID|Author|Title|Pub|Year|Pages|Lang|Size|Ext|Mirrors."""
     url = f"{mirror}/search.php"
     params = {"req": query, "res": max(25, limit), "view": "simple", "column": "def"}
-    r = requests.get(url, params=params, headers=HEADERS, timeout=20)
+    r = requests.get(url, params=params, headers=HEADERS, timeout=SEARCH_TIMEOUT)
     r.raise_for_status()
     body = r.text
 
@@ -124,7 +133,7 @@ def _search_li(query: str, mirror: str, limit: int) -> list[dict]:
         ("topics[]", "l"),
         ("res", max(25, limit)),
     ]
-    r = requests.get(url, params=params, headers=HEADERS, timeout=20)
+    r = requests.get(url, params=params, headers=HEADERS, timeout=SEARCH_TIMEOUT)
     r.raise_for_status()
     body = r.text
 
@@ -184,13 +193,26 @@ def _strip_tags(s: str) -> str:
     return s
 
 
-def resolve_downloads(md5: str) -> list[tuple[str, str]]:
-    """Return a list of (direct_url, referer) candidates from every resolver."""
-    candidates: list[tuple[str, str]] = []
+def resolve_downloads(md5: str, min_candidates: int = 2) -> list[tuple[str, str]]:
+    """Return a list of (direct_url, referer) download candidates.
+
+    Tries resolvers in order, deduping as it goes, and stops as soon as it has
+    `min_candidates` URLs — so a healthy first mirror means we never wait out the
+    slow/dead tail. Falls through to the next resolver on any error.
+    """
+    seen: set[str] = set()
+    out: list[tuple[str, str]] = []
+
+    def add(url: str, ref: str) -> None:
+        if url not in seen:
+            seen.add(url)
+            out.append((url, ref))
+
     for tmpl in DL_RESOLVERS:
         url = tmpl.format(md5=md5)
         try:
-            r = requests.get(url, headers=HEADERS, timeout=25, allow_redirects=True, verify=VERIFY_TLS)
+            r = requests.get(url, headers=HEADERS, timeout=RESOLVE_TIMEOUT,
+                             allow_redirects=True, verify=VERIFY_TLS)
             r.raise_for_status()
         except Exception as e:
             print(f"[resolver] {url} -> {e}", file=sys.stderr)
@@ -199,22 +221,19 @@ def resolve_downloads(md5: str) -> list[tuple[str, str]]:
 
         # library.lol — <a href="https://..."><h2>GET</h2></a>
         for m in re.finditer(r'href=["\'](https?://[^"\']+)["\'][^>]*>\s*<h2[^>]*>\s*GET\s*</h2>', r.text, re.I):
-            candidates.append((html.unescape(m.group(1)), referer))
+            add(html.unescape(m.group(1)), referer)
         # libgen.li — <a href="get.php?md5=...&key=...">
         for m in re.finditer(r'href=["\'](get\.php\?[^"\']+)["\']', r.text, re.I):
-            candidates.append((urljoin(r.url, html.unescape(m.group(1))), referer))
+            add(urljoin(r.url, html.unescape(m.group(1))), referer)
         # Generic: any direct link to a binary.
         for m in re.finditer(r'href=["\'](https?://[^"\']+\.(?:pdf|epub|djvu|mobi|azw3|zip))["\']', r.text, re.I):
-            candidates.append((html.unescape(m.group(1)), referer))
+            add(html.unescape(m.group(1)), referer)
 
-    # dedupe while preserving order
-    seen: set[str] = set()
-    out: list[tuple[str, str]] = []
-    for url, ref in candidates:
-        if url in seen:
-            continue
-        seen.add(url)
-        out.append((url, ref))
+        # Enough to work with (each download URL is tried in turn, with resume),
+        # so skip the remaining resolvers rather than risk a slow/dead one.
+        if len(out) >= min_candidates:
+            break
+
     return out
 
 
